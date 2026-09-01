@@ -193,6 +193,21 @@ def ultralytics_device(device: str | int) -> str | int | None:
     return None if device == "auto" else device
 
 
+def inference_half_enabled(device: str | int, amp_requested: bool) -> bool:
+    """Use FP16 inference only when the selected runtime can safely support it."""
+
+    if not amp_requested:
+        return False
+    normalized = str(device).strip().lower()
+    if normalized in {"cpu", "mps"}:
+        return False
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
 @dataclass(frozen=True)
 class RunContext:
     config: PipelineConfig
@@ -375,7 +390,11 @@ def supported_images(directory: Path) -> list[Path]:
     extensions = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
     if not directory.is_dir():
         return []
-    return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in extensions)
+    return sorted(
+        path
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in extensions
+    )
 
 
 def flatten_dict(prefix: str, payload: Mapping[str, Any]) -> Iterable[tuple[str, Any]]:
@@ -385,4 +404,3 @@ def flatten_dict(prefix: str, payload: Mapping[str, Any]) -> Iterable[tuple[str,
             yield from flatten_dict(name, value)
         else:
             yield name, value
-

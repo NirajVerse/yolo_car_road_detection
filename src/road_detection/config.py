@@ -123,7 +123,13 @@ class PipelineConfig:
         payload.pop("project_root")
         payload["experiment"]["output_root"] = str(self.experiment.output_root)
         payload["dataset"]["yaml"] = str(self.dataset.yaml)
-        payload["models"] = [asdict(model) for model in self.models]
+        payload["models"] = [
+            {
+                **asdict(model),
+                "weights": resolve_weights(model.weights, self.project_root),
+            }
+            for model in self.models
+        ]
         payload["selection"]["safety_classes"] = list(self.selection.safety_classes)
         payload["prediction"]["source"] = (
             str(self.prediction.source) if self.prediction.source else None
@@ -499,4 +505,3 @@ def resolve_weights(weights: str, project_root: Path) -> str:
     if value.parent != Path("."):
         return str((project_root / value).resolve())
     return weights
-
