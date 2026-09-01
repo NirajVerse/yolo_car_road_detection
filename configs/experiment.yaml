@@ -1,0 +1,67 @@
+experiment:
+  name: eco_car_yolo_size_comparison
+  seed: 42
+  output_root: artifacts
+
+dataset:
+  yaml: data.yaml
+
+models:
+  - id: yolo26n
+    weights: yolo26n.pt
+  - id: yolo26s
+    weights: yolo26s.pt
+  - id: yolo26m
+    weights: yolo26m.pt
+
+training:
+  epochs: 100
+  imgsz: 640
+  batch: 8
+  device: auto
+  workers: 8
+  patience: 20
+  pretrained: true
+  deterministic: true
+  amp: true
+  cache: false
+  resume: false
+
+smoke_test:
+  epochs: 1
+  fraction: 0.05
+  max_predictions: 1
+
+evaluation:
+  comparison_split: val
+  batch: 1
+  confidence: 0.25
+  prediction_iou: 0.70
+  matching_iou: 0.50
+  max_detections: 300
+
+benchmark:
+  batch: 1
+  warmup_iterations: 20
+  measured_iterations: 100
+  sample_count: 25
+
+selection:
+  primary_metric: map50_95
+  minimum_fps: null
+  map_tie_tolerance: 0.005
+  safety_classes:
+    - Person
+    - Traffic-light
+    - Traffic-sign
+    - Bike
+    - Motorcycle
+  tie_breaker: latency_p95_ms
+
+test:
+  evaluate_winner_only: true
+
+prediction:
+  source: null
+  confidence: 0.25
+

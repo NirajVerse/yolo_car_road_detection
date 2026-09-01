@@ -1,0 +1,31 @@
+# Paths in this file are resolved relative to this file by road_detection.
+# The dataset is intentionally stored outside the Git repository.
+path: ..
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 14
+names:
+  0: 16-Wheelers
+  1: Ad-signs
+  2: Bike
+  3: Bus
+  4: Car
+  5: Lamp-post
+  6: MiniBus
+  7: Motorcycle
+  8: Person
+  9: Pickup
+  10: Police-car
+  11: Traffic-light
+  12: Traffic-sign
+  13: Truck
+
+roboflow:
+  workspace: test2-dn3nz
+  project: roads-eivft
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/test2-dn3nz/roads-eivft/dataset/2
+

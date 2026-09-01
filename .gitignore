@@ -1,0 +1,28 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Runtime outputs and downloaded/trained weights
+artifacts/
+runs/
+*.pt
+*.onnx
+*.engine
+*.torchscript
+
+# Local data must remain outside version control
+train/
+valid/
+test/
+roads-dataset.zip
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.DS_Store
+
