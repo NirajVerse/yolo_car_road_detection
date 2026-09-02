@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from .config import load_dataset_spec
+from .data_audit import verify_dataset_unchanged
 from .evaluate import find_best_checkpoint
 from .utils import (
     RunContext,
@@ -21,6 +22,7 @@ from .utils import (
     inference_half_enabled,
     relative_to,
     require_completed,
+    runtime_dataset_yaml,
     sha256_file,
     supported_images,
     ultralytics_device,
@@ -134,9 +136,7 @@ def _predict_once(model: Any, image: np.ndarray, context: RunContext) -> None:
         conf=settings.confidence,
         iou=settings.prediction_iou,
         max_det=settings.max_detections,
-        half=inference_half_enabled(
-            context.config.training.device, context.config.training.amp
-        ),
+        half=inference_half_enabled(context.config.training.device, context.config.training.amp),
         save=False,
         stream=False,
         verbose=False,
@@ -220,7 +220,8 @@ def benchmark_candidates(context: RunContext) -> dict[str, Any]:
     """Benchmark all trained candidates using one preloaded validation input set."""
 
     require_completed(context, "evaluate")
-    spec = load_dataset_spec(context.dataset_yaml)
+    verify_dataset_unchanged(context)
+    spec = load_dataset_spec(runtime_dataset_yaml(context))
     available = supported_images(spec.split(context.config.evaluation.comparison_split))
     paths = _representative_images(available, context.config.benchmark.sample_count)
     if not paths:
@@ -250,9 +251,7 @@ def benchmark_candidates(context: RunContext) -> dict[str, Any]:
 
     summary = {
         "status": "failed" if failures else "completed",
-        "input_images": [
-            relative_to(path, context.config.project_root) for path in paths
-        ],
+        "input_images": [relative_to(path, context.config.project_root) for path in paths],
         "successful_models": [row["model_id"] for row in successes],
         "failed_models": failures,
         "models": [

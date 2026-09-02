@@ -104,9 +104,7 @@ def _confidences(value: Sequence[float] | np.ndarray, length: int) -> np.ndarray
     if array.size == 0:
         array = np.empty((0,), dtype=np.float64)
     if array.ndim != 1 or len(array) != length:
-        raise ValueError(
-            f"prediction_confidences must have shape ({length},), got {array.shape}"
-        )
+        raise ValueError(f"prediction_confidences must have shape ({length},), got {array.shape}")
     if not np.isfinite(array).all():
         raise ValueError("prediction_confidences contains non-finite values")
     if np.any((array < 0.0) | (array > 1.0)):
@@ -287,15 +285,9 @@ def aggregate_detection_coverage(
     for frame in frames:
         gt_boxes = _boxes(frame.ground_truth_boxes, "ground_truth_boxes")
         pred_boxes = _boxes(frame.prediction_boxes, "prediction_boxes")
-        gt_classes = _classes(
-            frame.ground_truth_classes, len(gt_boxes), "ground_truth_classes"
-        )
-        pred_classes = _classes(
-            frame.prediction_classes, len(pred_boxes), "prediction_classes"
-        )
-        unknown = sorted(
-            (set(gt_classes.tolist()) | set(pred_classes.tolist())) - set(class_ids)
-        )
+        gt_classes = _classes(frame.ground_truth_classes, len(gt_boxes), "ground_truth_classes")
+        pred_classes = _classes(frame.prediction_classes, len(pred_boxes), "prediction_classes")
+        unknown = sorted((set(gt_classes.tolist()) | set(pred_classes.tolist())) - set(class_ids))
         if unknown:
             raise ValueError(f"Detections contain unknown class ids: {unknown}")
         result = match_detections(
@@ -318,9 +310,7 @@ def aggregate_detection_coverage(
         row: dict[str, object] = {
             "class_id": class_id,
             "class_name": names[class_id],
-            **_coverage_row(
-                gt_counts[class_id], pred_counts[class_id], tp_counts[class_id]
-            ),
+            **_coverage_row(gt_counts[class_id], pred_counts[class_id], tp_counts[class_id]),
         }
         per_class.append(row)
 

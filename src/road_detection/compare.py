@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import csv
 import math
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 import matplotlib
 
@@ -21,6 +22,7 @@ from .utils import (
     read_json,
     relative_to,
     require_completed,
+    sha256_file,
     write_csv,
     write_json,
 )
@@ -34,6 +36,8 @@ class WinnerDecision:
     considered_models: tuple[str, ...]
     accuracy_tie_models: tuple[str, ...]
     metrics: Mapping[str, Any]
+    checkpoint: str | None
+    checkpoint_sha256: str | None
     fallback_score: float | None = None
 
 
@@ -50,12 +54,12 @@ def _best_by_smallest(rows: Sequence[Mapping[str, Any]], key: str) -> list[Mappi
     if not finite:
         return list(rows)
     best = min(_finite_number(row.get(key)) for row in finite)
-    return [row for row in finite if math.isclose(_finite_number(row.get(key)), best, abs_tol=1e-12)]
+    return [
+        row for row in finite if math.isclose(_finite_number(row.get(key)), best, abs_tol=1e-12)
+    ]
 
 
-def select_winner(
-    rows: Sequence[Mapping[str, Any]], settings: SelectionSettings
-) -> WinnerDecision:
+def select_winner(rows: Sequence[Mapping[str, Any]], settings: SelectionSettings) -> WinnerDecision:
     """Apply the documented validation-only selection rule.
 
     Rows must already include ``safety_class_mean_recall`` derived from the
@@ -71,7 +75,9 @@ def select_winner(
         and math.isfinite(_finite_number(row.get("latency_p95_ms")))
     ]
     if not eligible:
-        raise StageError("No successfully evaluated and benchmarked model is eligible for selection")
+        raise StageError(
+            "No successfully evaluated and benchmarked model is eligible for selection"
+        )
 
     fallback_score: float | None = None
     constraint_satisfied = True
@@ -79,7 +85,9 @@ def select_winner(
         pool = eligible
         rule_prefix = "No minimum FPS constraint was configured."
     else:
-        passing = [row for row in eligible if _finite_number(row.get("fps")) >= settings.minimum_fps]
+        passing = [
+            row for row in eligible if _finite_number(row.get("fps")) >= settings.minimum_fps
+        ]
         if passing:
             pool = passing
             rule_prefix = f"Models below {settings.minimum_fps:g} FPS were eliminated."
@@ -91,7 +99,9 @@ def select_winner(
                 score = _finite_number(row.get(settings.primary_metric), 0.0) * attainment
                 scored.append((score, row))
             fallback_score = max(score for score, _ in scored)
-            pool = [row for score, row in scored if math.isclose(score, fallback_score, abs_tol=1e-12)]
+            pool = [
+                row for score, row in scored if math.isclose(score, fallback_score, abs_tol=1e-12)
+            ]
             rule_prefix = (
                 f"No model met {settings.minimum_fps:g} FPS; used the declared fallback "
                 "score mAP50-95 × min(1, FPS/minimum_FPS)."
@@ -109,9 +119,7 @@ def select_winner(
         accuracy_ties = list(pool)
 
     finalists = accuracy_ties
-    safety_values = [
-        _finite_number(row.get("safety_class_mean_recall")) for row in finalists
-    ]
+    safety_values = [_finite_number(row.get("safety_class_mean_recall")) for row in finalists]
     finite_safety = [value for value in safety_values if math.isfinite(value)]
     if finite_safety:
         best_safety = max(finite_safety)
@@ -140,13 +148,15 @@ def select_winner(
         accuracy_tie_models=tuple(str(row["model_id"]) for row in accuracy_ties),
         metrics={
             "map50_95": _finite_number(winner_row.get("map50_95")),
-            "safety_class_mean_recall": _finite_number(
-                winner_row.get("safety_class_mean_recall")
-            ),
+            "safety_class_mean_recall": _finite_number(winner_row.get("safety_class_mean_recall")),
             "latency_p95_ms": _finite_number(winner_row.get("latency_p95_ms")),
             "fps": _finite_number(winner_row.get("fps")),
             "checkpoint_size_mib": _finite_number(winner_row.get("checkpoint_size_mib")),
         },
+        checkpoint=(str(winner_row["checkpoint"]) if winner_row.get("checkpoint") else None),
+        checkpoint_sha256=(
+            str(winner_row["checkpoint_sha256"]) if winner_row.get("checkpoint_sha256") else None
+        ),
         fallback_score=fallback_score,
     )
 
@@ -219,7 +229,9 @@ def _per_class_rows(metrics: Mapping[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _comparison_row(context: RunContext, model_id: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _comparison_row(
+    context: RunContext, model_id: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     model_dir = context.run_dir / "models" / model_id
     training = _load_optional(model_dir / "training.json")
     metrics = _load_optional(model_dir / "evaluation" / "metrics.json")
@@ -230,28 +242,52 @@ def _comparison_row(context: RunContext, model_id: str) -> tuple[dict[str, Any],
         benchmark = _load_optional(model_dir / "benchmark" / "benchmark.json")
     per_class = _per_class_rows(metrics)
     safety_values = [
-        _finite_number(
-            _first(row, "detection_recall", "coverage.recall", "recall")
-        )
+        _finite_number(_first(row, "detection_recall", "coverage.recall", "recall"))
         for row in per_class
         if row.get("class_name") in context.config.selection.safety_classes
         and math.isfinite(
-            _finite_number(
-                _first(row, "detection_recall", "coverage.recall", "recall")
-            )
+            _finite_number(_first(row, "detection_recall", "coverage.recall", "recall"))
         )
     ]
     statuses = [training.get("status"), metrics.get("status"), benchmark.get("status")]
-    status = "completed" if all(value == "completed" for value in statuses) else "failed"
+    checkpoint_hashes = {
+        "training": training.get("best_checkpoint_sha256"),
+        "evaluation": metrics.get("checkpoint_sha256"),
+        "benchmark": benchmark.get("checkpoint_sha256"),
+    }
+    identity_errors = [
+        f"{stage} checkpoint hash is missing"
+        for stage, value in checkpoint_hashes.items()
+        if not isinstance(value, str) or len(value) != 64
+    ]
+    valid_hashes = {
+        str(value)
+        for value in checkpoint_hashes.values()
+        if isinstance(value, str) and len(value) == 64
+    }
+    if len(valid_hashes) > 1:
+        identity_errors.append(
+            "training, evaluation, and benchmark used different checkpoint bytes"
+        )
+    status = (
+        "completed"
+        if all(value == "completed" for value in statuses) and not identity_errors
+        else "failed"
+    )
     errors = [
         str(_first(payload, "error", "failure_message"))
         for payload in (training, metrics, benchmark)
         if _first(payload, "error", "failure_message")
     ]
+    errors.extend(identity_errors)
     row = {
         "model_id": model_id,
         "status": status,
-        "failure_message": "; ".join(errors) if errors else (None if status == "completed" else "missing or incomplete artifact"),
+        "failure_message": "; ".join(errors)
+        if errors
+        else (None if status == "completed" else "missing or incomplete artifact"),
+        "checkpoint": training.get("best_checkpoint"),
+        "checkpoint_sha256": training.get("best_checkpoint_sha256"),
         "precision": _first(metrics, "precision", "aggregate.precision"),
         "recall": _first(metrics, "recall", "aggregate.recall"),
         "map50": _first(metrics, "map50", "aggregate.map50"),
@@ -266,14 +302,14 @@ def _comparison_row(context: RunContext, model_id: str) -> tuple[dict[str, Any],
         "safety_class_mean_recall": float(np.mean(safety_values)) if safety_values else None,
         "parameters": _first(metrics, "parameters", "efficiency.parameters"),
         "flops_g": _first(metrics, "flops_g", "efficiency.flops_g"),
-        "checkpoint_size_mib": _first(metrics, "checkpoint_size_mib", "efficiency.checkpoint_size_mib"),
+        "checkpoint_size_mib": _first(
+            metrics, "checkpoint_size_mib", "efficiency.checkpoint_size_mib"
+        ),
         "best_epoch": _first(training, "best_epoch"),
         "training_duration_seconds": _first(
             training, "training_duration_seconds", "duration_seconds"
         ),
-        "training_batch": _first(
-            training, "batch_size", "actual_settings.batch", "batch"
-        ),
+        "training_batch": _first(training, "batch_size", "actual_settings.batch", "batch"),
         "early_stopping": _first(training, "early_stopping", "early_stopped"),
         "preprocess_ms": _first(metrics, "speed.preprocess_ms", "preprocess_ms"),
         "inference_ms_ultralytics": _first(metrics, "speed.inference_ms", "inference_ms"),
@@ -324,7 +360,9 @@ def _grouped_bar(
     _save_figure(figure, path)
 
 
-def _single_bar(path: Path, rows: Sequence[Mapping[str, Any]], field: str, title: str, ylabel: str) -> None:
+def _single_bar(
+    path: Path, rows: Sequence[Mapping[str, Any]], field: str, title: str, ylabel: str
+) -> None:
     labels = [str(row["model_id"]) for row in rows]
     values = [_finite_number(row.get(field), 0.0) for row in rows]
     figure, axis = plt.subplots(figsize=(max(7, len(labels) * 1.6), 4.8))
@@ -365,7 +403,15 @@ def _heatmap(
         for column_index in range(values.shape[1]):
             value = values[row_index, column_index]
             text = "—" if not math.isfinite(float(value)) else f"{value:.2f}"
-            axis.text(column_index, row_index, text, ha="center", va="center", fontsize=7, color="white" if math.isfinite(float(value)) and value < 0.55 else "black")
+            axis.text(
+                column_index,
+                row_index,
+                text,
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="white" if math.isfinite(float(value)) and value < 0.55 else "black",
+            )
     figure.colorbar(image, ax=axis, label="score")
     _save_figure(figure, path)
 
@@ -415,10 +461,17 @@ def _plots(
     ):
         matrix = np.full((len(class_names), len(model_ids)), np.nan)
         for column, model_id in enumerate(model_ids):
-            lookup = {str(row.get("class_name")): row for row in per_class_by_model.get(model_id, [])}
+            lookup = {
+                str(row.get("class_name")): row for row in per_class_by_model.get(model_id, [])
+            }
             for row_index, class_name in enumerate(class_names):
                 matrix[row_index, column] = _finite_number(lookup.get(class_name, {}).get(metric))
         _heatmap(output_dir / filename, model_ids, class_names, matrix, title)
+
+
+def _display_number(row: Mapping[str, Any], key: str) -> str:
+    value = _finite_number(row.get(key))
+    return "—" if not math.isfinite(value) else f"{value:.4g}"
 
 
 def _summary_markdown(
@@ -435,29 +488,42 @@ def _summary_markdown(
         "## Controlled comparison",
         "",
         (
-            f"All candidates used the same dataset split, seed ({config.experiment.seed}), image size "
-            f"({config.training.imgsz}), epoch budget ({config.training.epochs}), validation confidence "
-            f"({config.evaluation.confidence}), matching IoU ({config.evaluation.matching_iou}), and local "
-            "batch-1 benchmark protocol. Candidate checkpoint architecture/size differed; any configured "
+            f"All candidates used the same dataset split, seed ({config.experiment.seed}), "
+            f"image size ({config.training.imgsz}), epoch budget ({config.training.epochs}), "
+            f"validation confidence ({config.evaluation.confidence}), matching IoU "
+            f"({config.evaluation.matching_iou}), and local batch-1 benchmark protocol. "
+            "Candidate checkpoint architecture/size differed; any configured "
             "per-model batch override is disclosed below."
         ),
         "",
-        "| Model | Status | mAP50–95 | Recall | Correct detections | Mean latency (ms) | p95 (ms) | FPS | Size (MiB) | Batch |",
+        (
+            "| Model | Status | mAP50–95 | Recall | Correct detections | "
+            "Mean latency (ms) | p95 (ms) | FPS | Size (MiB) | Batch |"
+        ),
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
-        number = lambda key: "—" if not math.isfinite(_finite_number(row.get(key))) else f"{_finite_number(row.get(key)):.4g}"
         lines.append(
-            f"| {row['model_id']} | {row['status']} | {number('map50_95')} | {number('recall')} | "
-            f"{number('true_positives')} | {number('latency_mean_ms')} | {number('latency_p95_ms')} | "
-            f"{number('fps')} | {number('checkpoint_size_mib')} | {number('training_batch')} |"
+            f"| {row['model_id']} | {row['status']} | "
+            f"{_display_number(row, 'map50_95')} | {_display_number(row, 'recall')} | "
+            f"{_display_number(row, 'true_positives')} | "
+            f"{_display_number(row, 'latency_mean_ms')} | "
+            f"{_display_number(row, 'latency_p95_ms')} | {_display_number(row, 'fps')} | "
+            f"{_display_number(row, 'checkpoint_size_mib')} | "
+            f"{_display_number(row, 'training_batch')} |"
         )
     lines.extend(["", "## Findings", ""])
     if successful:
-        best_accuracy = max(successful, key=lambda row: _finite_number(row.get("map50_95"), -math.inf))
+        best_accuracy = max(
+            successful, key=lambda row: _finite_number(row.get("map50_95"), -math.inf)
+        )
         best_recall = max(successful, key=lambda row: _finite_number(row.get("recall"), -math.inf))
-        most_correct = max(successful, key=lambda row: _finite_number(row.get("true_positives"), -math.inf))
-        fastest = min(successful, key=lambda row: _finite_number(row.get("latency_mean_ms"), math.inf))
+        most_correct = max(
+            successful, key=lambda row: _finite_number(row.get("true_positives"), -math.inf)
+        )
+        fastest = min(
+            successful, key=lambda row: _finite_number(row.get("latency_mean_ms"), math.inf)
+        )
         class_scores: dict[str, dict[str, list[float]]] = {}
         for row in successful:
             model_id = str(row["model_id"])
@@ -465,9 +531,7 @@ def _summary_markdown(
                 class_name = str(class_row.get("class_name", class_row.get("class_id", "unknown")))
                 bucket = class_scores.setdefault(class_name, {"map": [], "recall": []})
                 class_map = _finite_number(class_row.get("map50_95"))
-                class_recall = _finite_number(
-                    _first(class_row, "detection_recall", "recall")
-                )
+                class_recall = _finite_number(_first(class_row, "detection_recall", "recall"))
                 if math.isfinite(class_map):
                     bucket["map"].append(class_map)
                 if math.isfinite(class_recall):
@@ -494,18 +558,41 @@ def _summary_markdown(
             f"{_finite_number(fastest.get('map50_95')):.4f} mAP50–95 at "
             f"{_finite_number(fastest.get('latency_mean_ms')):.3f} ms."
         )
+        best_accuracy_value = _finite_number(best_accuracy.get("map50_95"))
+        best_recall_value = _finite_number(best_recall.get("recall"))
+        most_correct_value = int(_finite_number(most_correct.get("true_positives"), 0))
+        fastest_latency = _finite_number(fastest.get("latency_mean_ms"))
+        fastest_fps = _finite_number(fastest.get("fps"))
         lines.extend(
             [
-                f"- Highest validation mAP50–95: **{best_accuracy['model_id']}** ({_finite_number(best_accuracy.get('map50_95')):.4f}).",
-                f"- Best aggregate recall: **{best_recall['model_id']}** ({_finite_number(best_recall.get('recall')):.4f}).",
-                f"- Most correctly matched detections: **{most_correct['model_id']}** ({int(_finite_number(most_correct.get('true_positives'), 0))} true positives). Raw prediction count is not used as an accuracy metric.",
-                f"- Lowest controlled mean latency: **{fastest['model_id']}** ({_finite_number(fastest.get('latency_mean_ms')):.3f} ms/image; {_finite_number(fastest.get('fps')):.2f} FPS).",
+                (
+                    f"- Highest validation mAP50–95: **{best_accuracy['model_id']}** "
+                    f"({best_accuracy_value:.4f})."
+                ),
+                (
+                    f"- Best aggregate recall: **{best_recall['model_id']}** "
+                    f"({best_recall_value:.4f})."
+                ),
+                (
+                    f"- Most correctly matched detections: **{most_correct['model_id']}** "
+                    f"({most_correct_value} true positives). Raw prediction count is not "
+                    "used as an accuracy metric."
+                ),
+                (
+                    f"- Lowest controlled mean latency: **{fastest['model_id']}** "
+                    f"({fastest_latency:.3f} ms/image; {fastest_fps:.2f} FPS)."
+                ),
                 f"- Consistently weakest class by mean per-class mAP: {weakest_text}.",
                 f"- Accuracy–latency tradeoff: {accuracy_latency_text}",
-                "- Overfitting heuristic: " + "; ".join(
+                "- Overfitting heuristic: "
+                + "; ".join(
                     f"{row['model_id']} — {row['overfitting_evidence']}" for row in successful
-                ) + ".",
-                "- Small mAP differences near the configured tie tolerance should not be overstated on this relatively small dataset.",
+                )
+                + ".",
+                (
+                    "- Small mAP differences near the configured tie tolerance should "
+                    "not be overstated on this relatively small dataset."
+                ),
             ]
         )
     failures = [row for row in rows if row.get("status") != "completed"]
@@ -517,7 +604,10 @@ def _summary_markdown(
                 "",
                 *[f"- **{row['model_id']}**: {row['failure_message']}" for row in failures],
                 "",
-                "Winner selection is blocked until every configured candidate completes successfully.",
+                (
+                    "Winner selection is blocked until every configured candidate "
+                    "completes successfully."
+                ),
             ]
         )
     elif decision is not None:
@@ -529,9 +619,11 @@ def _summary_markdown(
                 f"**{decision.winner}** is selected. {decision.rule}",
                 "",
                 (
-                    f"Winner metrics: mAP50–95={decision.metrics['map50_95']:.4f}, safety-class mean "
-                    f"recall={decision.metrics['safety_class_mean_recall']:.4f}, p95 latency="
-                    f"{decision.metrics['latency_p95_ms']:.3f} ms, FPS={decision.metrics['fps']:.2f}, "
+                    f"Winner metrics: mAP50–95={decision.metrics['map50_95']:.4f}, "
+                    "safety-class mean recall="
+                    f"{decision.metrics['safety_class_mean_recall']:.4f}, "
+                    f"p95 latency={decision.metrics['latency_p95_ms']:.3f} ms, "
+                    f"FPS={decision.metrics['fps']:.2f}, "
                     f"checkpoint={decision.metrics['checkpoint_size_mib']:.2f} MiB."
                 ),
                 "",
@@ -577,11 +669,15 @@ def compare_models(context: RunContext) -> dict[str, str]:
             "status": "blocked_incomplete",
             "winner": None,
             "failed_models": [row["model_id"] for row in failures],
-            "reason": "Every configured candidate must finish training, validation, and benchmarking before selection.",
+            "reason": (
+                "Every configured candidate must finish training, validation, and "
+                "benchmarking before selection."
+            ),
         }
         write_json(selection_path, blocked)
         selection_md_path.write_text(
-            "# Model selection\n\nSelection is blocked because these configured candidates are incomplete: "
+            "# Model selection\n\nSelection is blocked because these configured "
+            "candidates are incomplete: "
             + ", ".join(str(row["model_id"]) for row in failures)
             + ". No test evaluation is permitted yet.\n",
             encoding="utf-8",
@@ -604,15 +700,15 @@ def compare_models(context: RunContext) -> dict[str, str]:
             f"Validation metrics: mAP50–95={decision.metrics['map50_95']:.4f}, "
             f"safety-class mean recall={decision.metrics['safety_class_mean_recall']:.4f}, "
             f"p95 latency={decision.metrics['latency_p95_ms']:.3f} ms, "
-            f"FPS={decision.metrics['fps']:.2f}, checkpoint={decision.metrics['checkpoint_size_mib']:.2f} MiB.\n\n"
-            "The winner is frozen before test evaluation and will not be revised from test results.\n",
+            f"FPS={decision.metrics['fps']:.2f}, "
+            f"checkpoint={decision.metrics['checkpoint_size_mib']:.2f} MiB.\n\n"
+            "The winner is frozen before test evaluation and will not be revised "
+            "from test results.\n",
             encoding="utf-8",
         )
 
     summary_path = output_dir / "summary.md"
-    summary_path.write_text(
-        _summary_markdown(context, rows, decision, per_class), encoding="utf-8"
-    )
+    summary_path.write_text(_summary_markdown(context, rows, decision, per_class), encoding="utf-8")
     outputs = {
         "model_comparison_csv": relative_to(csv_path, context.run_dir),
         "model_comparison_json": relative_to(json_path, context.run_dir),
@@ -621,14 +717,24 @@ def compare_models(context: RunContext) -> dict[str, str]:
     }
     if failures:
         raise StageError(
-            "Comparison artifacts were written, but selection is blocked by failed/incomplete models: "
-            + ", ".join(str(row["model_id"]) for row in failures)
+            "Comparison artifacts were written, but selection is blocked by "
+            "failed/incomplete models: " + ", ".join(str(row["model_id"]) for row in failures)
         )
+    context.update_manifest(
+        selection={
+            "status": "frozen",
+            "winner": decision.winner if decision is not None else None,
+            "artifact": relative_to(selection_path, context.run_dir),
+            "sha256": sha256_file(selection_path),
+            "checkpoint": decision.checkpoint if decision is not None else None,
+            "checkpoint_sha256": (decision.checkpoint_sha256 if decision is not None else None),
+        }
+    )
     return outputs
 
 
 def load_class_names(context: RunContext) -> Iterable[str]:
     from .config import load_dataset_spec
 
-    spec = load_dataset_spec(context.config.dataset.yaml)
+    spec = load_dataset_spec(context.dataset_yaml)
     return (spec.names[index] for index in range(spec.nc))

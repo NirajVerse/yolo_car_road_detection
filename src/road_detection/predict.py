@@ -10,6 +10,8 @@ import numpy as np
 from PIL import Image
 
 from .config import load_dataset_spec, resolve_weights
+from .data_audit import verify_dataset_unchanged
+from .evaluate import find_best_checkpoint
 from .utils import (
     RunContext,
     StageError,
@@ -18,38 +20,30 @@ from .utils import (
     read_json,
     relative_to,
     require_completed,
+    sha256_file,
     supported_images,
     write_csv,
     write_json,
 )
 
 
-def _winner_checkpoint(context: RunContext, winner: str) -> Path:
-    training_path = context.run_dir / "models" / winner / "training.json"
-    training = read_json(training_path)
-    if training.get("status") != "completed":
-        raise StageError(f"Winner {winner!r} does not have a completed training artifact")
-    value = training.get("best_checkpoint")
-    if not value:
-        raise StageError(f"Winner {winner!r} training metadata has no best_checkpoint")
-    path = Path(str(value))
-    path = path if path.is_absolute() else context.run_dir / path
-    if not path.is_file():
-        raise StageError(f"Winner checkpoint does not exist: {path}")
-    return path.resolve()
-
-
 def _choose_source(context: RunContext, source: str | Path | None) -> Path:
     if source is not None:
         value = Path(source).expanduser()
-        path = (context.config.project_root / value).resolve() if not value.is_absolute() else value.resolve()
+        path = (
+            (context.config.project_root / value).resolve()
+            if not value.is_absolute()
+            else value.resolve()
+        )
     elif context.config.prediction.source is not None:
         path = context.config.prediction.source.resolve()
     else:
-        spec = load_dataset_spec(context.config.dataset.yaml)
+        spec = load_dataset_spec(context.dataset_yaml)
         candidates = supported_images(spec.split("test"))
         if not candidates:
-            raise StageError("No supported test image is available for deterministic demonstration selection")
+            raise StageError(
+                "No supported test image is available for deterministic demonstration selection"
+            )
         # Lexicographic selection is deterministic and does not inspect winner output.
         path = candidates[0]
     if not path.is_file():
@@ -101,11 +95,26 @@ def predict_winner(context: RunContext, source: str | Path | None = None) -> dic
     """Run the frozen winner on one image and save image/JSON/CSV artifacts."""
 
     require_completed(context, "compare", "test_winner")
-    selection = read_json(context.run_dir / "comparison" / "selection.json")
+    verify_dataset_unchanged(context)
+    selection_path = context.run_dir / "comparison" / "selection.json"
+    selection = read_json(selection_path)
     if selection.get("status") != "frozen" or not selection.get("winner"):
         raise StageError("A frozen validation winner is required before prediction")
     winner = str(selection["winner"])
-    checkpoint = _winner_checkpoint(context, winner)
+    frozen_selection = context.manifest.get("selection", {})
+    expected_selection_hash = frozen_selection.get("sha256")
+    if (
+        not isinstance(expected_selection_hash, str)
+        or sha256_file(selection_path) != expected_selection_hash
+    ):
+        raise StageError("Frozen selection.json changed after validation comparison")
+    checkpoint = find_best_checkpoint(context, winner)
+    expected_checkpoint_hash = selection.get("checkpoint_sha256")
+    if (
+        not isinstance(expected_checkpoint_hash, str)
+        or sha256_file(checkpoint) != expected_checkpoint_hash
+    ):
+        raise StageError("Prediction checkpoint does not match the frozen selection")
     source_path = _choose_source(context, source)
     output_dir = context.run_dir / "predictions"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -125,14 +134,14 @@ def predict_winner(context: RunContext, source: str | Path | None = None) -> dic
         imgsz=context.config.training.imgsz,
         device=None if context.config.training.device == "auto" else context.config.training.device,
         max_det=context.config.evaluation.max_detections,
-        half=inference_half_enabled(
-            context.config.training.device, context.config.training.amp
-        ),
+        half=inference_half_enabled(context.config.training.device, context.config.training.amp),
         save=False,
         verbose=False,
     )
     if not results:
         raise StageError("Ultralytics returned no result object for the prediction image")
+    if sha256_file(checkpoint) != expected_checkpoint_hash:
+        raise StageError("Winner checkpoint changed during prediction")
     result = results[0]
     names_raw = getattr(result, "names", None) or getattr(model, "names", {})
     if isinstance(names_raw, list):

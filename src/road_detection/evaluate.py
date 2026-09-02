@@ -5,12 +5,14 @@ from __future__ import annotations
 import itertools
 import logging
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .config import load_dataset_spec
+from .data_audit import verify_dataset_unchanged
 from .metrics import DetectionFrame, aggregate_detection_coverage
 from .utils import (
     RunContext,
@@ -22,6 +24,7 @@ from .utils import (
     read_json,
     relative_to,
     require_completed,
+    runtime_dataset_yaml,
     sha256_file,
     supported_images,
     ultralytics_device,
@@ -81,9 +84,7 @@ def _result_dict(metrics: Any) -> Mapping[str, Any]:
 
 def _metric_from_result_dict(result: Mapping[str, Any], *tokens: str) -> float | None:
     normalized_tokens = tuple(token.lower().replace(" ", "") for token in tokens)
-    normalized_items = [
-        (str(key).lower().replace(" ", ""), value) for key, value in result.items()
-    ]
+    normalized_items = [(str(key).lower().replace(" ", ""), value) for key, value in result.items()]
     for token in normalized_tokens:
         for normalized_key, value in normalized_items:
             if normalized_key == token:
@@ -118,9 +119,7 @@ def _extract_metric_rows(
     )
     map50_95 = coalesce(
         _first_float(box, "map"),
-        _metric_from_result_dict(
-            result, "metrics/map50-95(b)", "metrics/map50-95"
-        ),
+        _metric_from_result_dict(result, "metrics/map50-95(b)", "metrics/map50-95"),
     )
 
     ap = _as_array(getattr(box, "ap", None))
@@ -185,9 +184,7 @@ def _extract_metric_rows(
                 "recall": at(per_recall, index),
                 "map50": at(per_ap50, index),
                 "map75": at(per_map75, index),
-                "map50_95": at(
-                    per_map, class_id if full_class_indexed_map else index
-                ),
+                "map50_95": at(per_map, class_id if full_class_indexed_map else index),
             }
         )
     return aggregate, per_class
@@ -210,43 +207,28 @@ def read_training_provenance(context: RunContext, model_id: str) -> dict[str, An
 def find_best_checkpoint(context: RunContext, model_id: str) -> Path:
     """Resolve the successful training run's ``best.pt`` without loading it."""
 
-    model_dir = context.run_dir / "models" / model_id
     provenance = read_training_provenance(context, model_id)
+    if not provenance:
+        raise StageError(f"Training provenance is missing for {model_id}")
     status = str(provenance.get("status", "")).lower()
-    if provenance and status not in {"completed", "success", "succeeded"}:
+    if status not in {"completed", "success", "succeeded"}:
         raise StageError(f"Training for {model_id} is not completed (status={status!r})")
 
     configured = provenance.get("best_checkpoint")
-    candidates: list[Path] = []
-    if isinstance(configured, str) and configured:
-        candidates.append(_resolve_artifact_path(configured, context))
-    candidates.extend(
-        [
-            model_dir / "best.pt",
-            model_dir / "weights" / "best.pt",
-            model_dir / "train" / "weights" / "best.pt",
-        ]
-    )
-    ultralytics_dir = provenance.get("ultralytics_run_dir")
-    if isinstance(ultralytics_dir, str) and ultralytics_dir:
-        candidates.append(
-            _resolve_artifact_path(ultralytics_dir, context) / "weights" / "best.pt"
+    expected_hash = provenance.get("best_checkpoint_sha256")
+    if not isinstance(configured, str) or not configured:
+        raise StageError(f"Training provenance has no frozen best.pt path for {model_id}")
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise StageError(f"Training provenance has no frozen best.pt hash for {model_id}")
+    checkpoint = _resolve_artifact_path(configured, context)
+    if not checkpoint.is_file() or checkpoint.name != "best.pt":
+        raise StageError(f"Frozen best.pt is missing for {model_id}: {checkpoint}")
+    actual_hash = sha256_file(checkpoint)
+    if actual_hash != expected_hash:
+        raise StageError(
+            f"Frozen best.pt changed after training for {model_id}: {checkpoint}. Start a new run."
         )
-    if model_dir.is_dir():
-        candidates.extend(sorted(model_dir.glob("**/weights/best.pt")))
-
-    seen: set[Path] = set()
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if candidate.is_file() and candidate.name == "best.pt":
-            return candidate
-    raise StageError(
-        f"No successful best.pt was found for {model_id}; run training and preserve "
-        "its training.json"
-    )
+    return checkpoint
 
 
 def _training_value(provenance: Mapping[str, Any], *keys: str) -> Any:
@@ -285,10 +267,8 @@ def _model_efficiency(model: Any, checkpoint: Path) -> dict[str, Any]:
     if isinstance(info, (tuple, list)) and len(info) >= 4:
         flops_g = _as_float(info[3])
         if parameters is None:
-            try:
+            with suppress(TypeError, ValueError):
                 parameters = int(info[1])
-            except (TypeError, ValueError):
-                pass
     elif isinstance(info, Mapping):
         flops_g = _first_float(info, "flops", "gflops", "GFLOPs")
 
@@ -325,7 +305,7 @@ def _ground_truth(image: Path, images_root: Path) -> tuple[np.ndarray, np.ndarra
     boxes: list[list[float]] = []
     classes: list[int] = []
     for line_number, raw_line in enumerate(
-        label_path.read_text(encoding="utf-8").splitlines(), start=1
+        label_path.read_text(encoding="utf-8-sig").splitlines(), start=1
     ):
         line = raw_line.strip()
         if not line:
@@ -377,7 +357,7 @@ def _coverage_predictions(
     save_predictions: bool,
     output_dir: Path,
 ) -> dict[str, Any]:
-    spec = load_dataset_spec(context.dataset_yaml)
+    spec = load_dataset_spec(runtime_dataset_yaml(context))
     images_root = spec.split(split)
     images = supported_images(images_root)
     if not images:
@@ -393,18 +373,14 @@ def _coverage_predictions(
         "conf": settings.confidence,
         "iou": settings.prediction_iou,
         "max_det": settings.max_detections,
-        "half": inference_half_enabled(
-            context.config.training.device, context.config.training.amp
-        ),
+        "half": inference_half_enabled(context.config.training.device, context.config.training.amp),
         "save": save_predictions,
         "save_txt": save_predictions,
         "save_conf": save_predictions,
         "verbose": False,
     }
     if save_predictions:
-        predict_kwargs.update(
-            {"project": str(output_dir), "name": "predictions", "exist_ok": True}
-        )
+        predict_kwargs.update({"project": str(output_dir), "name": "predictions", "exist_ok": True})
     results: Iterable[Any] = model.predict(**predict_kwargs)
     frames: list[DetectionFrame] = []
     sentinel = object()
@@ -479,7 +455,7 @@ def _run_evaluation(
     model = YOLO(str(checkpoint), task="detect")
     settings = context.config.evaluation
     val_kwargs: dict[str, Any] = {
-        "data": str(context.dataset_yaml),
+        "data": str(runtime_dataset_yaml(context)),
         "split": split,
         "imgsz": context.config.training.imgsz,
         "batch": settings.batch,
@@ -487,9 +463,7 @@ def _run_evaluation(
         "conf": settings.confidence,
         "iou": settings.prediction_iou,
         "max_det": settings.max_detections,
-        "half": inference_half_enabled(
-            context.config.training.device, context.config.training.amp
-        ),
+        "half": inference_half_enabled(context.config.training.device, context.config.training.amp),
         "plots": True,
         "save_json": True,
         "save_txt": save_predictions,
@@ -500,7 +474,7 @@ def _run_evaluation(
         "verbose": False,
     }
     validation_metrics = model.val(**val_kwargs)
-    spec = load_dataset_spec(context.dataset_yaml)
+    spec = load_dataset_spec(runtime_dataset_yaml(context))
     aggregate, metric_rows = _extract_metric_rows(validation_metrics, spec.names)
     coverage = _coverage_predictions(
         model,
@@ -599,6 +573,7 @@ def evaluate_candidates(context: RunContext) -> dict[str, Any]:
     """Evaluate every configured candidate's trained ``best.pt`` on validation."""
 
     require_completed(context, "train")
+    verify_dataset_unchanged(context)
     split = context.config.evaluation.comparison_split
     successes: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -705,12 +680,20 @@ def evaluate_winner_test(context: RunContext) -> dict[str, Any]:
     """Evaluate only the validation-selected winner on the untouched test split."""
 
     require_completed(context, "compare")
+    verify_dataset_unchanged(context)
     if not context.config.test.evaluate_winner_only:
         raise StageError("Winner-only test evaluation guard is disabled; refusing to run")
     selection_path = context.run_dir / "comparison" / "selection.json"
     if not selection_path.is_file():
         raise StageError("Frozen comparison/selection.json is required before test evaluation")
     selection = read_json(selection_path)
+    frozen_selection = context.manifest.get("selection", {})
+    expected_selection_hash = frozen_selection.get("sha256")
+    if (
+        not isinstance(expected_selection_hash, str)
+        or sha256_file(selection_path) != expected_selection_hash
+    ):
+        raise StageError("Frozen selection.json changed after validation comparison")
     if str(selection.get("status", "")).lower() != "frozen":
         raise StageError("selection.json is not a completed frozen selection")
     winner_id = _selected_model_id(selection)
@@ -719,6 +702,12 @@ def evaluate_winner_test(context: RunContext) -> dict[str, Any]:
         raise StageError(f"Selected winner {winner_id!r} is not a configured model")
 
     checkpoint = find_best_checkpoint(context, winner_id)
+    expected_checkpoint_hash = selection.get("checkpoint_sha256")
+    if (
+        not isinstance(expected_checkpoint_hash, str)
+        or sha256_file(checkpoint) != expected_checkpoint_hash
+    ):
+        raise StageError("Selected winner checkpoint does not match the frozen selection")
     output_dir = context.run_dir / "test"
     output_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Evaluating frozen winner %s on the test split", winner_id)
@@ -730,6 +719,8 @@ def evaluate_winner_test(context: RunContext) -> dict[str, Any]:
         output_dir,
         save_predictions=True,
     )
+    if payload.get("checkpoint_sha256") != expected_checkpoint_hash:
+        raise StageError("Winner checkpoint changed during test evaluation")
     payload["selection"] = {
         "artifact": relative_to(selection_path, context.run_dir),
         "sha256": sha256_file(selection_path),

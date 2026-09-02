@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import ConfigError, load_config
 from .utils import (
@@ -14,6 +15,8 @@ from .utils import (
     RunContext,
     create_run,
     list_run_ids,
+    record_prediction_source_override,
+    recorded_prediction_source,
     resume_run,
     run_stage,
     setup_logging,
@@ -79,7 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
             command_parser.add_argument(
                 "--source",
                 type=Path,
-                help="Demonstration image; otherwise prediction.source or a deterministic test image is used.",
+                help=(
+                    "Demonstration image; otherwise prediction.source or a deterministic "
+                    "test image is used."
+                ),
             )
     return parser
 
@@ -168,7 +174,17 @@ def _dispatch_single(context: RunContext, args: argparse.Namespace) -> None:
     elif args.command == "predict":
         from .predict import predict_winner
 
-        _single_stage(context, "predict", predict_winner, args, source=args.source)
+        source = args.source
+        if source is not None:
+            if context.stage_status("predict") == "completed" and not args.force:
+                raise PipelineError(
+                    "Prediction already completed for this run; use --force to replace only "
+                    "the demonstration output or start a new run."
+                )
+            source = record_prediction_source_override(context, source)
+        else:
+            source = recorded_prediction_source(context)
+        _single_stage(context, "predict", predict_winner, args, source=source)
         context.finalize()
     else:
         raise PipelineError(f"Unsupported command: {args.command}")
@@ -182,6 +198,15 @@ def _run_all(context: RunContext, args: argparse.Namespace) -> None:
     from .predict import predict_winner
     from .train import run_smoke_test, train_candidates
 
+    source = args.source
+    if source is not None:
+        if context.stage_status("predict") == "completed" and not args.force:
+            raise PipelineError(
+                "Prediction already completed for this run; omit --source to resume unchanged."
+            )
+        source = record_prediction_source_override(context, source)
+    else:
+        source = recorded_prediction_source(context)
     stages: list[tuple[str, Callable[..., Any], dict[str, Any]]] = [
         ("audit", run_audit, {}),
         ("smoke_test", run_smoke_test, {}),
@@ -190,7 +215,7 @@ def _run_all(context: RunContext, args: argparse.Namespace) -> None:
         ("benchmark", benchmark_candidates, {}),
         ("compare", compare_models, {}),
         ("test_winner", evaluate_winner_test, {}),
-        ("predict", predict_winner, {"source": args.source}),
+        ("predict", predict_winner, {"source": source}),
     ]
     for name, function, kwargs in stages:
         _single_stage(context, name, function, args, **kwargs)

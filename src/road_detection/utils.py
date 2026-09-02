@@ -10,12 +10,14 @@ import logging
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import yaml
@@ -23,6 +25,7 @@ import yaml
 from .config import PipelineConfig, load_dataset_spec, write_resolved_dataset_yaml
 
 LOGGER = logging.getLogger("road_detection")
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 class PipelineError(RuntimeError):
@@ -34,11 +37,25 @@ class StageError(PipelineError):
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def new_run_id() -> str:
-    return datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def recorded_prediction_source(context: RunContext) -> Path | None:
+    """Return a previously persisted CLI prediction source, when present."""
+
+    raw = context.manifest.get("cli_overrides", {}).get("prediction.source")
+    if not isinstance(raw, str) or not raw:
+        return None
+    value = Path(raw).expanduser()
+    return (
+        (context.config.project_root / value).resolve()
+        if not value.is_absolute()
+        else value.resolve()
+    )
 
 
 def json_safe(value: Any) -> Any:
@@ -79,7 +96,9 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str] | None = None) -> None:
+def write_csv(
+    path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str] | None = None
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if fieldnames is None:
         ordered: list[str] = []
@@ -262,7 +281,9 @@ class RunContext:
 
     def finalize(self) -> None:
         payload = self.manifest
-        failed = [name for name, row in payload.get("stages", {}).items() if row.get("status") == "failed"]
+        failed = [
+            name for name, row in payload.get("stages", {}).items() if row.get("status") == "failed"
+        ]
         payload["status"] = "failed" if failed else "completed"
         payload["completed_at"] = utc_now()
         payload["updated_at"] = utc_now()
@@ -277,17 +298,30 @@ def list_run_ids(config: PipelineConfig) -> list[str]:
     root = _experiment_dir(config)
     if not root.is_dir():
         return []
-    return sorted(path.name for path in root.iterdir() if path.is_dir() and (path / "manifest.json").is_file())
+    return sorted(
+        path.name for path in root.iterdir() if path.is_dir() and (path / "manifest.json").is_file()
+    )
 
 
 def create_run(config: PipelineConfig, run_id: str | None = None) -> RunContext:
     run_id = run_id or new_run_id()
-    if not run_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for char in run_id):
-        raise StageError("run id may contain only letters, numbers, dots, dashes, and underscores")
+    if not _SAFE_RUN_ID.fullmatch(run_id):
+        raise StageError(
+            "run id must start with a letter/number and contain only letters, "
+            "numbers, dots, dashes, and underscores"
+        )
     run_dir = _experiment_dir(config) / run_id
     if run_dir.exists():
         raise StageError(f"Run already exists: {run_dir}. Resume it with --run-id {run_id}")
-    for directory in ("logs", "data_audit", "smoke_test", "models", "comparison", "test", "predictions"):
+    for directory in (
+        "logs",
+        "data_audit",
+        "smoke_test",
+        "models",
+        "comparison",
+        "test",
+        "predictions",
+    ):
         (run_dir / directory).mkdir(parents=True, exist_ok=True)
     resolved_config_path = run_dir / "resolved_config.yaml"
     resolved_config_path.write_text(
@@ -303,19 +337,31 @@ def create_run(config: PipelineConfig, run_id: str | None = None) -> RunContext:
         "updated_at": utc_now(),
         "completed_at": None,
         "status": "created",
+        "configuration": {
+            "source": relative_to(config.config_path, config.project_root),
+            "source_sha256": sha256_file(config.config_path),
+            "resolved": "resolved_config.yaml",
+            "resolved_sha256": sha256_file(resolved_config_path),
+        },
         "git": git_provenance(config.project_root),
         "dataset": {
             "yaml": relative_to(config.dataset.yaml, config.project_root),
+            "source_descriptor_sha256": sha256_file(config.dataset.yaml),
             "resolved_yaml": relative_to(resolved_dataset, run_dir),
             "fingerprint": None,
         },
         "models": [
-            {"id": model.id, "weights": model.weights, "batch": model.batch or config.training.batch}
+            {
+                "id": model.id,
+                "weights": model.weights,
+                "batch": model.batch or config.training.batch,
+            }
             for model in config.models
         ],
         "seed": config.experiment.seed,
         "environment": basic_environment(),
         "resolved_config": "resolved_config.yaml",
+        "cli_overrides": {},
         "stages": {},
         "results": {},
     }
@@ -343,13 +389,181 @@ def resume_run(config: PipelineConfig, run_id: str | None = None) -> RunContext:
     manifest = read_json(manifest_path)
     if manifest.get("experiment_name") != config.experiment.name:
         raise StageError(f"Run {selected!r} belongs to a different experiment")
+    configuration = manifest.get("configuration", {})
+    expected_config_hash = configuration.get("source_sha256")
+    current_config_hash = sha256_file(config.config_path)
+    if expected_config_hash and expected_config_hash != current_config_hash:
+        raise StageError(
+            "Configuration drift detected: the experiment YAML changed after this run "
+            "was created. Start a new audit/run instead of mixing artifacts."
+        )
+    expected_dataset_hash = manifest.get("dataset", {}).get("source_descriptor_sha256")
+    current_dataset_hash = sha256_file(config.dataset.yaml)
+    if expected_dataset_hash and expected_dataset_hash != current_dataset_hash:
+        raise StageError(
+            "Dataset descriptor drift detected after run creation. Start a new audit/run."
+        )
+
+    resolved_config_path = run_dir / "resolved_config.yaml"
+    expected_resolved_hash = configuration.get("resolved_sha256")
+    if (
+        not isinstance(expected_resolved_hash, str)
+        or not resolved_config_path.is_file()
+        or sha256_file(resolved_config_path) != expected_resolved_hash
+    ):
+        raise StageError("Frozen resolved configuration changed after run creation")
+    try:
+        saved = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise StageError(f"Could not validate frozen resolved configuration: {exc}") from exc
+    current = config.to_dict()
+    if isinstance(saved, dict):
+        # The source-YAML hashes above protect the configured checkpoint names.
+        # Normalize these fields because a bare registry checkpoint can become a
+        # project-local path after audit downloads it.
+        for index, model in enumerate(config.models):
+            for payload in (saved, current):
+                rows = payload.get("models")
+                if isinstance(rows, list) and index < len(rows) and isinstance(rows[index], dict):
+                    rows[index]["weights"] = model.weights
+        if manifest.get("cli_overrides", {}).get("prediction.source") is not None:
+            saved.setdefault("prediction", {})["source"] = current.get("prediction", {}).get(
+                "source"
+            )
+    if saved != current:
+        raise StageError(
+            "Resolved configuration drift detected. Start a new audit/run rather than "
+            "combining incompatible settings."
+        )
     return RunContext(config, selected, run_dir, manifest_path, dataset_yaml)
+
+
+def record_prediction_source_override(context: RunContext, source: str | Path) -> Path:
+    """Persist the exact CLI prediction-source override in run provenance."""
+
+    value = Path(source).expanduser()
+    resolved = (
+        (context.config.project_root / value).resolve()
+        if not value.is_absolute()
+        else value.resolve()
+    )
+    resolved_config_path = context.run_dir / "resolved_config.yaml"
+    try:
+        payload = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise StageError(f"Could not update resolved configuration: {exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("prediction"), dict):
+        raise StageError("Frozen resolved configuration has no prediction section")
+    payload["prediction"]["source"] = str(resolved)
+    temporary = resolved_config_path.with_suffix(".yaml.tmp")
+    temporary.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    temporary.replace(resolved_config_path)
+
+    manifest = context.manifest
+    manifest.setdefault("cli_overrides", {})["prediction.source"] = str(resolved)
+    manifest.setdefault("configuration", {})["resolved_sha256"] = sha256_file(resolved_config_path)
+    manifest["updated_at"] = utc_now()
+    write_json(context.manifest_path, manifest)
+    return resolved
 
 
 def require_completed(context: RunContext, *stages: str) -> None:
     missing = [stage for stage in stages if context.stage_status(stage) != "completed"]
     if missing:
         raise StageError(f"Required stage(s) not completed: {', '.join(missing)}")
+
+
+def audited_source_weights(context: RunContext, model_id: str, configured: str) -> str:
+    """Return the audit-frozen source checkpoint and verify its hash when local."""
+
+    model_rows = context.manifest.get("models", [])
+    record = next(
+        (
+            row
+            for row in model_rows
+            if isinstance(row, Mapping) and row.get("model_id", row.get("id")) == model_id
+        ),
+        None,
+    )
+    if not isinstance(record, Mapping) or record.get("status") != "loaded":
+        raise StageError(f"Model {model_id!r} has no successful checkpoint audit record")
+    checkpoint_value = record.get("checkpoint_path")
+    if checkpoint_value:
+        checkpoint = Path(str(checkpoint_value)).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = (context.config.project_root / checkpoint).resolve()
+        if not checkpoint.is_file():
+            raise StageError(f"Audited source checkpoint is missing: {checkpoint}")
+        expected_hash = record.get("checkpoint_sha256")
+        if expected_hash and sha256_file(checkpoint) != expected_hash:
+            raise StageError(
+                f"Audited source checkpoint changed after audit: {checkpoint}. "
+                "Start a new audit/run."
+            )
+        return str(checkpoint)
+    from .config import resolve_weights
+
+    return resolve_weights(configured, context.config.project_root)
+
+
+def runtime_dataset_yaml(context: RunContext) -> Path:
+    """Return the audit-created artifact-local dataset descriptor."""
+
+    dataset = context.manifest.get("dataset", {})
+    value = dataset.get("runtime_yaml")
+    if not isinstance(value, str) or not value:
+        raise StageError(
+            "The audit did not create an artifact-local runtime dataset. Rerun audit in a new run."
+        )
+    path = Path(value)
+    path = path if path.is_absolute() else context.run_dir / path
+    if not path.is_file():
+        raise StageError(f"Artifact-local runtime dataset descriptor is missing: {path}")
+
+    manifest_value = dataset.get("runtime_manifest")
+    expected_manifest_hash = dataset.get("runtime_manifest_sha256")
+    if not isinstance(manifest_value, str) or not isinstance(expected_manifest_hash, str):
+        raise StageError("Artifact-local runtime dataset integrity record is missing")
+    manifest_path = Path(manifest_value)
+    if not manifest_path.is_absolute():
+        manifest_path = context.run_dir / manifest_path
+    if not manifest_path.is_file() or sha256_file(manifest_path) != expected_manifest_hash:
+        raise StageError("Artifact-local runtime dataset manifest changed after audit")
+    integrity = read_json(manifest_path)
+    records = integrity.get("records")
+    if not isinstance(records, list) or not records:
+        raise StageError("Artifact-local runtime dataset manifest has no file records")
+    for raw_record in records:
+        if not isinstance(raw_record, Mapping):
+            raise StageError("Artifact-local runtime dataset manifest has an invalid record")
+        declared = Path(str(raw_record.get("path", "")))
+        if declared.is_absolute() or ".." in declared.parts:
+            raise StageError("Artifact-local runtime dataset manifest has an unsafe path")
+        artifact = context.run_dir / declared
+        kind = raw_record.get("kind")
+        if kind == "image_symlink":
+            expected_target = Path(str(raw_record.get("target", "")))
+            if not artifact.is_symlink() or artifact.resolve() != expected_target.resolve():
+                raise StageError(f"Runtime image link changed after audit: {artifact}")
+            expected_hash = raw_record.get("sha256")
+            try:
+                actual_hash = sha256_file(artifact)
+            except OSError as exc:
+                raise StageError(f"Runtime image link is unreadable: {artifact}") from exc
+            if not isinstance(expected_hash, str) or actual_hash != expected_hash:
+                raise StageError(f"Runtime image content changed after audit: {artifact}")
+        elif kind in {"label_copy", "descriptor"}:
+            expected_hash = raw_record.get("sha256")
+            if (
+                artifact.is_symlink()
+                or not artifact.is_file()
+                or not isinstance(expected_hash, str)
+                or sha256_file(artifact) != expected_hash
+            ):
+                raise StageError(f"Runtime dataset file changed after audit: {artifact}")
+        else:
+            raise StageError(f"Unknown runtime dataset record kind: {kind!r}")
+    return path.resolve()
 
 
 def run_stage(
@@ -381,7 +595,8 @@ def import_ultralytics_yolo() -> Any:
         from ultralytics import YOLO
     except ImportError as exc:
         raise StageError(
-            "Ultralytics is not installed in this environment. Install the project dependencies first."
+            "Ultralytics is not installed in this environment. Install the project "
+            "dependencies first."
         ) from exc
     return YOLO
 

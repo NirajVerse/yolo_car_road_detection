@@ -14,16 +14,20 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .config import ModelSettings, load_dataset_spec, resolve_weights
+from .config import ModelSettings, load_dataset_spec
+from .data_audit import verify_dataset_unchanged
 from .utils import (
     LOGGER,
     RunContext,
     StageError,
+    audited_source_weights,
     import_ultralytics_yolo,
     read_json,
     relative_to,
     require_completed,
+    runtime_dataset_yaml,
     seed_everything,
+    sha256_file,
     ultralytics_device,
     utc_now,
     write_json,
@@ -111,7 +115,7 @@ def _training_arguments(
 ) -> dict[str, Any]:
     training = context.config.training
     arguments: dict[str, Any] = {
-        "data": str(context.dataset_yaml),
+        "data": str(runtime_dataset_yaml(context)),
         "epochs": epochs,
         "imgsz": training.imgsz,
         "batch": candidate.batch or training.batch,
@@ -201,16 +205,14 @@ def _best_epoch(rows: Sequence[Mapping[str, Any]], trainer: Any) -> int | None:
     stopper_best = getattr(stopper, "best_epoch", None)
     for value in (trainer_best, stopper_best):
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            return value
+            # Ultralytics trainer/stopper epochs are zero-based internally;
+            # reports use a human-readable one-based epoch number.
+            return value + 1
 
     if not rows:
         return None
     map_key = next(
-        (
-            key
-            for key in rows[0]
-            if "map50-95" in key.lower().replace(" ", "")
-        ),
+        (key for key in rows[0] if "map50-95" in key.lower().replace(" ", "")),
         None,
     )
     if map_key is not None:
@@ -219,10 +221,16 @@ def _best_epoch(rows: Sequence[Mapping[str, Any]], trainer: Any) -> int | None:
         if finite:
             row = rows[max(finite, key=lambda item: item[0])[1]]
             epoch = _float_or_none(row.get("epoch"))
-            return int(epoch) if epoch is not None else max(finite, key=lambda item: item[0])[1] + 1
+            if epoch is not None:
+                first_epoch = _float_or_none(rows[0].get("epoch"))
+                return int(epoch) + 1 if first_epoch == 0 else int(epoch)
+            return max(finite, key=lambda item: item[0])[1] + 1
 
     epoch = _float_or_none(rows[-1].get("epoch"))
-    return int(epoch) if epoch is not None else len(rows)
+    if epoch is not None:
+        first_epoch = _float_or_none(rows[0].get("epoch"))
+        return int(epoch) + 1 if first_epoch == 0 else int(epoch)
+    return len(rows)
 
 
 def _metrics_from_training(result: Any, trainer: Any) -> dict[str, Any]:
@@ -247,6 +255,11 @@ def _trainer_artifacts(
 
     save_dir_raw = getattr(trainer, "save_dir", None)
     run_dir = Path(save_dir_raw).resolve() if save_dir_raw else expected_run_dir.resolve()
+    if run_dir != expected_run_dir.resolve():
+        raise StageError(
+            f"Ultralytics wrote to unexpected directory {run_dir}; expected "
+            f"the isolated attempt directory {expected_run_dir.resolve()}"
+        )
     best_raw = getattr(trainer, "best", None)
     last_raw = getattr(trainer, "last", None)
     best = Path(best_raw).resolve() if best_raw else run_dir / "weights" / "best.pt"
@@ -318,30 +331,68 @@ def _completed_candidate_record(
         return None
     best = _record_path(record.get("best_checkpoint"), context)
     results = _record_path(record.get("results_csv"), context)
-    if (
-        best is None
-        or not best.is_file()
-        or results is None
-        or not results.is_file()
-    ):
+    if best is None or not best.is_file() or results is None or not results.is_file():
         raise StageError(
             f"Completed training record has missing artifacts: {summary_path}. "
             "Start a new run instead of silently replacing it."
         )
+    expected_hash = record.get("best_checkpoint_sha256")
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+        raise StageError(f"Completed training record has no frozen best.pt hash: {summary_path}")
+    if sha256_file(best) != expected_hash:
+        raise StageError(f"Completed best.pt changed after training: {best}. Start a new run.")
     return record
 
 
-def run_smoke_test(context: RunContext) -> dict[str, Any]:
-    """Run the configured short smoke test with the first (smallest) candidate.
+def _smoke_candidate(context: RunContext) -> tuple[ModelSettings, str]:
+    """Choose the smallest audited checkpoint by parameters, size, then config order."""
 
-    Candidate ordering is meaningful: ``models[0]`` is documented as the
-    smallest/cheapest checkpoint and is the only model used for smoke testing.
-    This function is intentionally called only by an explicit runtime CLI stage.
+    audit_rows = {
+        str(row.get("model_id", row.get("id"))): row
+        for row in context.manifest.get("models", [])
+        if isinstance(row, Mapping)
+    }
+
+    def positive_number(value: Any) -> float | None:
+        parsed = _float_or_none(value)
+        return parsed if parsed is not None and parsed > 0 else None
+
+    ranked: list[tuple[tuple[Any, ...], ModelSettings]] = []
+    for index, candidate in enumerate(context.config.models):
+        row = audit_rows.get(candidate.id, {})
+        parameters = positive_number(row.get("parameter_count"))
+        size = positive_number(row.get("checkpoint_size_bytes"))
+        rank = (
+            parameters is None,
+            parameters if parameters is not None else math.inf,
+            size is None,
+            size if size is not None else math.inf,
+            index,
+        )
+        ranked.append((rank, candidate))
+    _, winner = min(ranked, key=lambda item: item[0])
+    winner_row = audit_rows.get(winner.id, {})
+    reason = (
+        "smallest audited candidate by parameter count, then checkpoint bytes, "
+        "then configuration order"
+    )
+    if positive_number(winner_row.get("parameter_count")) is None:
+        reason += " (parameter count unavailable for at least the selected candidate)"
+    return winner, reason
+
+
+def run_smoke_test(context: RunContext) -> dict[str, Any]:
+    """Run a one-epoch smoke test with the smallest audited candidate.
+
+    Audit-measured parameter count chooses the smallest model, with checkpoint
+    bytes and configuration order as deterministic fallbacks. This function is
+    intentionally called only by an explicit runtime CLI stage.
     """
 
     require_completed(context, "audit")
+    verify_dataset_unchanged(context)
     config = context.config
-    candidate = config.models[0]
+    candidate, selection_reason = _smoke_candidate(context)
     smoke_root = context.run_dir / "smoke_test"
     summary_path = smoke_root / "smoke_test.json"
     existing = read_json(summary_path) if summary_path.is_file() else None
@@ -354,7 +405,7 @@ def run_smoke_test(context: RunContext) -> dict[str, Any]:
     try:
         seed_everything(config.experiment.seed, config.training.deterministic)
         YOLO = import_ultralytics_yolo()
-        source_weights = resolve_weights(candidate.weights, config.project_root)
+        source_weights = audited_source_weights(context, candidate.id, candidate.weights)
         model = YOLO(source_weights)
         _require_detection_model(model, source_weights)
 
@@ -369,12 +420,10 @@ def run_smoke_test(context: RunContext) -> dict[str, Any]:
         training_started = time.perf_counter()
         result = model.train(**requested)
         training_seconds = time.perf_counter() - training_started
-        run_dir, best, last, results_csv, trainer = _trainer_artifacts(
-            model, expected_run_dir
-        )
+        run_dir, best, last, results_csv, trainer = _trainer_artifacts(model, expected_run_dir)
         rows = _read_result_rows(results_csv)
 
-        dataset = load_dataset_spec(context.dataset_yaml)
+        dataset = load_dataset_spec(runtime_dataset_yaml(context))
         sources = _find_images(dataset.split("val"))[: config.smoke_test.max_predictions]
         if not sources:
             raise StageError(
@@ -414,7 +463,7 @@ def run_smoke_test(context: RunContext) -> dict[str, Any]:
             "schema_version": 1,
             "status": "completed",
             "model_id": candidate.id,
-            "selection_reason": "first configured candidate (documented smallest model)",
+            "selection_reason": selection_reason,
             "attempt": attempt_name,
             "started_at": started_at,
             "completed_at": utc_now(),
@@ -428,17 +477,19 @@ def run_smoke_test(context: RunContext) -> dict[str, Any]:
             "fraction": config.smoke_test.fraction,
             "epochs_completed": epochs_completed,
             "best_epoch": _best_epoch(rows, trainer),
+            "best_epoch_basis": "one-based epoch number",
             "early_stopping": epochs_completed < config.smoke_test.epochs,
             "ultralytics_run_dir": _portable_path(run_dir, context),
             "results_csv": _portable_path(results_csv, context),
             "best_checkpoint": _portable_path(best, context),
+            "best_checkpoint_sha256": sha256_file(best),
+            "best_checkpoint_size_bytes": best.stat().st_size,
             "last_checkpoint": _portable_path(last, context),
+            "last_checkpoint_sha256": sha256_file(last),
             "metrics": _metrics_from_training(result, trainer),
             "prediction_sources": [str(path.resolve()) for path in sources],
             "prediction_dir": _portable_path(prediction_dir, context),
-            "saved_predictions": [
-                _portable_path(path, context) for path in saved_predictions
-            ],
+            "saved_predictions": [_portable_path(path, context) for path in saved_predictions],
             "error": None,
         }
         summary = _write_summary(
@@ -461,7 +512,7 @@ def run_smoke_test(context: RunContext) -> dict[str, Any]:
             "schema_version": 1,
             "status": "failed",
             "model_id": candidate.id,
-            "selection_reason": "first configured candidate (documented smallest model)",
+            "selection_reason": selection_reason,
             "attempt": attempt_name,
             "started_at": started_at,
             "completed_at": utc_now(),
@@ -503,7 +554,7 @@ def _train_one_candidate(
     started_at = utc_now()
     started = time.perf_counter()
     requested: dict[str, Any] = {}
-    source_weights = resolve_weights(candidate.weights, context.config.project_root)
+    source_weights = audited_source_weights(context, candidate.id, candidate.weights)
 
     try:
         seed_everything(
@@ -522,9 +573,7 @@ def _train_one_candidate(
         training_started = time.perf_counter()
         result = model.train(**requested)
         training_seconds = time.perf_counter() - training_started
-        run_dir, best, last, results_csv, trainer = _trainer_artifacts(
-            model, expected_run_dir
-        )
+        run_dir, best, last, results_csv, trainer = _trainer_artifacts(model, expected_run_dir)
         rows = _read_result_rows(results_csv)
         epochs_completed = len(rows)
         record: dict[str, Any] = {
@@ -546,11 +595,15 @@ def _train_one_candidate(
             "requested_epochs": context.config.training.epochs,
             "epochs_completed": epochs_completed,
             "best_epoch": _best_epoch(rows, trainer),
+            "best_epoch_basis": "one-based epoch number",
             "early_stopping": epochs_completed < context.config.training.epochs,
             "ultralytics_run_dir": _portable_path(run_dir, context),
             "results_csv": _portable_path(results_csv, context),
             "best_checkpoint": _portable_path(best, context),
+            "best_checkpoint_sha256": sha256_file(best),
+            "best_checkpoint_size_bytes": best.stat().st_size,
             "last_checkpoint": _portable_path(last, context),
+            "last_checkpoint_sha256": sha256_file(last),
             "metrics": _metrics_from_training(result, trainer),
             "error": None,
         }
@@ -606,6 +659,7 @@ def train_candidates(
     """
 
     require_completed(context, "audit", "smoke_test")
+    verify_dataset_unchanged(context)
     YOLO = import_ultralytics_yolo()
     records: dict[str, dict[str, Any]] = {}
     reused_models: list[str] = []

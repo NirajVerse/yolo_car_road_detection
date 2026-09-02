@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import math
+import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
+
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_DEVICE = re.compile(r"^(?:auto|cpu|mps|cuda(?::\d+)?|\d+)$", re.IGNORECASE)
+_SENSITIVE_METADATA_KEY = re.compile(
+    r"(?:api[_-]?key|authorization|password|secret|signed[_-]?url|token)",
+    re.IGNORECASE,
+)
 
 
 class ConfigError(ValueError):
@@ -205,9 +216,50 @@ def _validate_checkpoint_name(weights: str, name: str) -> None:
     if not weights.strip():
         raise ConfigError(f"{name} must be a non-empty string")
     stem = Path(weights).stem.lower()
-    forbidden = ("-cls", "-seg", "-pose", "-obb")
+    forbidden = ("-cls", "-seg", "-sem", "-pose", "-obb", "-depth")
     if any(token in stem for token in forbidden):
         raise ConfigError(f"{name} is not a standard axis-aligned detection checkpoint: {weights}")
+
+
+def _safe_identifier(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not _SAFE_IDENTIFIER.fullmatch(value):
+        raise ConfigError(
+            f"{name} must start with a letter/number and contain only letters, "
+            "numbers, dots, dashes, or underscores"
+        )
+    return value
+
+
+def _validate_device(value: Any) -> str | int:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ConfigError("training.device must be a string or integer")
+    if isinstance(value, int):
+        if value < 0:
+            raise ConfigError("training.device integer must be a non-negative CUDA index")
+        return value
+    if not _DEVICE.fullmatch(value.strip()):
+        raise ConfigError("training.device must be auto, cpu, mps, cuda, cuda:N, or one CUDA index")
+    return value.strip().lower()
+
+
+def _sanitize_metadata(value: Any, key: str = "") -> Any:
+    """Remove credentials and signed URL queries from copied dataset metadata."""
+
+    if key and _SENSITIVE_METADATA_KEY.search(key):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _sanitize_metadata(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_metadata(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_metadata(item) for item in value]
+    if isinstance(value, str) and value.lower().startswith(("http://", "https://")):
+        parsed = urlsplit(value)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return value
 
 
 def load_config(path: str | Path) -> PipelineConfig:
@@ -231,14 +283,12 @@ def load_config(path: str | Path) -> PipelineConfig:
     ).resolve()
 
     exp = _mapping(_required(root, "experiment", "configuration"), "experiment")
-    name = _required(exp, "name", "experiment")
-    if not isinstance(name, str) or not name.strip():
-        raise ConfigError("experiment.name must be a non-empty string")
-    if any(char in name for char in "/\\") or name in {".", ".."}:
-        raise ConfigError("experiment.name must be a safe directory name")
+    name = _safe_identifier(_required(exp, "name", "experiment"), "experiment.name")
     experiment = ExperimentSettings(
         name=name,
-        seed=_positive_int(_required(exp, "seed", "experiment"), "experiment.seed", allow_zero=True),
+        seed=_positive_int(
+            _required(exp, "seed", "experiment"), "experiment.seed", allow_zero=True
+        ),
         output_root=_resolve_project_path(
             _required(exp, "output_root", "experiment"), project_root, "experiment.output_root"
         ),
@@ -259,12 +309,8 @@ def load_config(path: str | Path) -> PipelineConfig:
     ids: set[str] = set()
     for index, item in enumerate(model_rows):
         row = _mapping(item, f"models[{index}]")
-        model_id = _required(row, "id", f"models[{index}]")
+        model_id = _safe_identifier(_required(row, "id", f"models[{index}]"), f"models[{index}].id")
         weights = _required(row, "weights", f"models[{index}]")
-        if not isinstance(model_id, str) or not model_id.strip():
-            raise ConfigError(f"models[{index}].id must be a non-empty string")
-        if any(char in model_id for char in "/\\") or model_id in {".", ".."}:
-            raise ConfigError(f"models[{index}].id must be a safe directory name")
         if model_id in ids:
             raise ConfigError(f"Duplicate model id: {model_id}")
         if not isinstance(weights, str):
@@ -277,12 +323,20 @@ def load_config(path: str | Path) -> PipelineConfig:
         ids.add(model_id)
 
     train = _mapping(_required(root, "training", "configuration"), "training")
-    device = _required(train, "device", "training")
-    if not isinstance(device, (str, int)) or isinstance(device, bool):
-        raise ConfigError("training.device must be a string or integer")
+    device = _validate_device(_required(train, "device", "training"))
     cache = _required(train, "cache", "training")
-    if not isinstance(cache, (bool, str)):
-        raise ConfigError("training.cache must be a boolean or Ultralytics cache mode")
+    if isinstance(cache, str):
+        cache = cache.lower().strip()
+        if cache not in {"ram", "disk"}:
+            raise ConfigError("training.cache string must be 'ram' or 'disk'")
+    elif not isinstance(cache, bool):
+        raise ConfigError("training.cache must be false, true, 'ram', or 'disk'")
+    resume = _bool(_required(train, "resume", "training"), "training.resume")
+    if resume:
+        raise ConfigError(
+            "training.resume=true is not supported by this controlled comparison; "
+            "resume pipeline stages with --run-id instead"
+        )
     training = TrainingSettings(
         epochs=_positive_int(_required(train, "epochs", "training"), "training.epochs"),
         imgsz=_positive_int(_required(train, "imgsz", "training"), "training.imgsz"),
@@ -300,17 +354,21 @@ def load_config(path: str | Path) -> PipelineConfig:
         ),
         amp=_bool(_required(train, "amp", "training"), "training.amp"),
         cache=cache,
-        resume=_bool(_required(train, "resume", "training"), "training.resume"),
+        resume=resume,
     )
 
     smoke_raw = _mapping(root.get("smoke_test", {}), "smoke_test")
     smoke_test = SmokeTestSettings(
         epochs=_positive_int(smoke_raw.get("epochs", 1), "smoke_test.epochs"),
-        fraction=_probability(smoke_raw.get("fraction", 0.05), "smoke_test.fraction", zero_allowed=False),
+        fraction=_probability(
+            smoke_raw.get("fraction", 0.05), "smoke_test.fraction", zero_allowed=False
+        ),
         max_predictions=_positive_int(
             smoke_raw.get("max_predictions", 1), "smoke_test.max_predictions"
         ),
     )
+    if smoke_test.epochs != 1:
+        raise ConfigError("smoke_test.epochs must be exactly 1")
 
     eval_raw = _mapping(_required(root, "evaluation", "configuration"), "evaluation")
     split = _required(eval_raw, "comparison_split", "evaluation")
@@ -359,7 +417,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         if isinstance(minimum_fps_raw, bool) or not isinstance(minimum_fps_raw, (int, float)):
             raise ConfigError("selection.minimum_fps must be null or numeric")
         minimum_fps_raw = float(minimum_fps_raw)
-        if minimum_fps_raw <= 0:
+        if not math.isfinite(minimum_fps_raw) or minimum_fps_raw <= 0:
             raise ConfigError("selection.minimum_fps must be positive")
     tolerance = _required(selection_raw, "map_tie_tolerance", "selection")
     if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)):
@@ -368,7 +426,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     if not 0 <= tolerance <= 1:
         raise ConfigError("selection.map_tie_tolerance must be in [0, 1]")
     safety = _required(selection_raw, "safety_classes", "selection")
-    if not isinstance(safety, list) or not safety or not all(isinstance(x, str) and x for x in safety):
+    if (
+        not isinstance(safety, list)
+        or not safety
+        or not all(isinstance(x, str) and x for x in safety)
+    ):
         raise ConfigError("selection.safety_classes must be a non-empty list of names")
     if len(set(safety)) != len(safety):
         raise ConfigError("selection.safety_classes contains duplicates")
@@ -389,7 +451,8 @@ def load_config(path: str | Path) -> PipelineConfig:
     )
     if not evaluate_winner_only:
         raise ConfigError(
-            "test.evaluate_winner_only must remain true unless an explicit post-selection study is added"
+            "test.evaluate_winner_only must remain true unless an explicit "
+            "post-selection study is added"
         )
     test = TestSettings(evaluate_winner_only=evaluate_winner_only)
 
@@ -466,9 +529,15 @@ def load_dataset_spec(path: str | Path) -> DatasetSpec:
         if not isinstance(value, str) or not value:
             raise ConfigError(f"Dataset {split} path must be a non-empty string")
         split_path = Path(value).expanduser()
-        splits[split] = (root / split_path).resolve() if not split_path.is_absolute() else split_path.resolve()
+        splits[split] = (
+            (root / split_path).resolve() if not split_path.is_absolute() else split_path.resolve()
+        )
 
-    metadata = {key: value for key, value in data.items() if key not in {"path", "train", "val", "test", "nc", "names"}}
+    metadata = {
+        key: value
+        for key, value in data.items()
+        if key not in {"path", "train", "val", "test", "nc", "names"}
+    }
     return DatasetSpec(
         yaml_path=yaml_path,
         root=root,
@@ -490,7 +559,7 @@ def write_resolved_dataset_yaml(spec: DatasetSpec, destination: Path) -> Path:
         "test": str(spec.splits["test"]),
         "nc": spec.nc,
         "names": dict(spec.names),
-        **dict(spec.metadata),
+        **_sanitize_metadata(spec.metadata),
     }
     destination.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
     return destination
@@ -504,4 +573,7 @@ def resolve_weights(weights: str, project_root: Path) -> str:
         return str(value.resolve())
     if value.parent != Path("."):
         return str((project_root / value).resolve())
+    local_candidate = (project_root / value).resolve()
+    if local_candidate.is_file():
+        return str(local_candidate)
     return weights
